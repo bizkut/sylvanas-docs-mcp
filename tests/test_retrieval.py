@@ -67,6 +67,70 @@ class RetrievalTests(unittest.TestCase):
         suffix = self.service.lookup_symbol("log")
         self.assertTrue(all(row["match_type"] == "symbol_suffix" for row in suffix["definitions"]))
 
+    def test_questions_drop_filler_and_fall_back_to_partial_matches(self):
+        results = self.service.search_docs("how do I create a spell", limit=5)["results"]
+        self.assertEqual(results[0]["context"], "IZI > izi.spell")
+        self.assertEqual(results[0]["match_type"], "lexical")
+        partial = self.service.search_docs("logging create", limit=5)["results"]
+        self.assertEqual({item["match_type"] for item in partial}, {"partial"})
+        self.assertIn("Core > core.log", [item["context"] for item in partial])
+
+    def add_api_fixtures(self):
+        (self.sources / "legacy/_api/globals.lua").write_text("_G.core = {}\n", encoding="utf-8")
+        module = self.sources / "legacy/_api/common/modules/demo_mod.lua"
+        module.parent.mkdir(parents=True)
+        module.write_text("---@class demo_mod\n---Runs the demo.\n---@field public run fun(self: demo_mod): boolean\n", encoding="utf-8")
+        (self.sources / "izi/demo/extra.lua").write_text("core.secret_helper()\nlocal x = get()\nx:hidden_method()\n", encoding="utf-8")
+        self.rebuild()
+
+    def test_check_lua_api_flags_invented_names_with_suggestions(self):
+        self.add_api_fixtures()
+        code = """local demo = require("common/modules/demo_mod")
+local own = require("helpers")
+local log = core.log
+local function f(unit)
+  core.log("x -- core.fake()") -- core.fake_comment()
+  core.logg("typo")
+  demo:run()
+  demo:runn()
+  own:anything()
+  unit:totally_made_up()
+  log("aliased")
+end
+"""
+        result = self.service.check_lua_api(code)
+        errors = {item["expression"]: item for item in result["issues"] if item["severity"] == "error"}
+        self.assertEqual(set(errors), {"core.logg", "demo:runn", "unit:totally_made_up"})
+        self.assertEqual(errors["core.logg"]["suggestions"][0], "core.log")
+        self.assertEqual(errors["demo:runn"]["suggestions"], ["demo_mod.run"])
+        self.assertEqual(errors["unit:totally_made_up"]["kind"], "unknown_method")
+        self.assertIn("core.log", [item["name"] for item in result["verified"]])
+        self.assertIn("demo_mod.run", [item["name"] for item in result["verified"]])
+        self.assertFalse(result["ok"])
+        self.assertTrue(self.service.check_lua_api("core.log('fine')")["ok"])
+
+    def test_check_lua_api_downgrades_names_used_by_official_examples(self):
+        self.add_api_fixtures()
+        result = self.service.check_lua_api("core.secret_helper()\nlocal me = get()\nme:hidden_method()\n")
+        self.assertEqual([item["severity"] for item in result["issues"]], ["warning", "warning"])
+        self.assertTrue(result["ok"])
+        with self.assertRaises(RetrievalError):
+            self.service.check_lua_api("x" * 100_001)
+
+    def test_list_members_returns_signatures_and_rejects_unknown_namespaces(self):
+        self.add_api_fixtures()
+        members = self.service.list_members("demo_mod")["members"]
+        self.assertEqual([item["name"] for item in members], ["demo_mod.run"])
+        self.assertEqual(members[0]["summary"], "Runs the demo.")
+        self.assertEqual(members[0]["signatures"][0]["signature"], "run fun(self: demo_mod): boolean")
+        core = self.service.list_members("core")
+        self.assertIn("core.log", [item["name"] for item in core["members"]])
+        with self.assertRaises(RetrievalError):
+            self.service.list_members("demo_modd")
+
+    def test_search_matches_word_stems(self):
+        self.assertIn("Core > core.log", [item["context"] for item in self.service.search_docs("logs definitions")["results"]])
+
     def test_signature_headings_define_only_the_declared_identifier(self):
         headings = [
             "`core.object_manager.get_local_player() -> game_object`",
@@ -217,7 +281,10 @@ class RetrievalTests(unittest.TestCase):
             with self.subTest(query=query), self.assertRaises(RetrievalError):
                 self.service.search_docs(query)
         # Operators and quotes are literal terms, not executable FTS expressions.
-        self.assertEqual(self.service.search_docs('" OR NOT * :')['results'], [])
+        # NOT would exclude everything if executed; as a literal word it matches only text containing "not".
+        literal = self.service.search_docs('" OR NOT * :')['results']
+        self.assertEqual([item["context"] for item in literal], ["Guide > Tips"])
+        self.assertIn("Core > core.log", [item["context"] for item in self.service.search_docs('"zzz" NOT core')['results']])
         with self.assertRaises(RetrievalError):
             self.service.read_api_source("legacy/_api/core.lua", 1, 401)
 

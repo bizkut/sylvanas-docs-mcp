@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from contextlib import closing
+import difflib
 import json
 from pathlib import Path
 import re
@@ -10,6 +11,7 @@ import sqlite3
 from typing import Any
 from urllib.parse import unquote, urlsplit
 
+from .checker import is_sdk_module, require_owner, scan
 from .index import SCHEMA_VERSION, RetrievalError, canonical_url, digest, normalized_symbol, safe_read
 
 MAX_RESULTS = 20
@@ -18,6 +20,12 @@ MAX_READ_CHARS = 32_000
 MAX_READ_LINES = 400
 FAMILIES = {"izi", "legacy", "general"}
 DOCUMENT_TYPES = {"docs", "stub", "example"}
+MAX_MEMBERS = 300
+MAX_ISSUES = 50
+# Question filler dropped from queries so that natural-language questions still match.
+STOPWORDS = {"a", "an", "and", "are", "at", "be", "by", "can", "do", "does", "for", "from", "how", "i",
+             "in", "is", "it", "me", "my", "of", "on", "or", "should", "the", "to", "what", "when",
+             "where", "which", "with"}
 
 
 def validate_limit(limit: int) -> None:
@@ -25,14 +33,15 @@ def validate_limit(limit: int) -> None:
         raise RetrievalError("limit must be an integer between 1 and 20")
 
 
-def query_expression(query: str) -> str:
+def query_expression(query: str, operator: str = "AND") -> str:
     if not isinstance(query, str) or not query.strip() or len(query) > 512:
         raise RetrievalError("query must contain 1 to 512 characters")
     tokens = re.findall(r"\w+", query, flags=re.UNICODE)
     if not tokens or len(tokens) > 32:
         raise RetrievalError("query must contain 1 to 32 words or identifier components")
+    tokens = [token for token in tokens if token.casefold() not in STOPWORDS] or tokens
     # Treat input as literal words, never as user-controlled FTS or SQL syntax.
-    return " AND ".join('"' + token.replace('"', '""') + '"' for token in tokens)
+    return f" {operator} ".join('"' + token.replace('"', '""') + '"' for token in tokens)
 
 
 def bounded_content(payload: dict) -> dict:
@@ -104,8 +113,9 @@ class Corpus:
                     document_type: str | None = None, limit: int = 5) -> dict[str, Any]:
         """Search docs, Lua stubs and examples; exact identifier definitions rank first.
 
-        Family: izi/legacy/general. Type: docs/stub/example. Literal words are
-        combined with AND; no FTS operators. Results include capped content and provenance.
+        Family: izi/legacy/general. Type: docs/stub/example. Literal words (question
+        filler dropped) are combined with AND; if that yields fewer than limit results,
+        records matching any word fill the rest as match_type "partial". No FTS operators. Results include capped content and provenance.
         """
         return self._search(query, api_family, document_type, limit, False)
 
@@ -117,16 +127,25 @@ class Corpus:
         if lexical_only:
             filters += " AND NOT EXISTS (SELECT 1 FROM symbols s WHERE s.record_id=r.id AND s.name=?)"
             parameters.append(normalized_symbol(query))
-        sql = """SELECT r.payload, bm25(search, 3.0, 5.0, 1.0) AS score,
+        sql = """SELECT r.id, r.payload, bm25(search, 3.0, 5.0, 1.0) AS score,
                  (SELECT min(quality) FROM symbols s WHERE s.record_id=r.id AND s.name=?) AS exact_quality
                  FROM search JOIN records r ON r.id=search.rowid
                  WHERE search MATCH ?""" + filters + " ORDER BY coalesce(exact_quality,2), score, r.id LIMIT ?"
         with closing(self.connect()) as db:
             rows = db.execute(sql, [normalized_symbol(query), expression, *parameters, limit + 1]).fetchall()
+            matched = {row["id"] for row in rows}
+            partial = []
+            if len(rows) <= limit:
+                # Too few records contain every word: top up with records matching any of them.
+                # bm25 favours records that match more of the words.
+                any_expression = query_expression(query, "OR")
+                if any_expression != expression:
+                    partial = [row for row in db.execute(sql, [normalized_symbol(query), any_expression, *parameters, limit + 1]).fetchall() if row["id"] not in matched]
+        rows = [(row, False) for row in rows] + [(row, True) for row in partial]
         results = []
-        for row in rows[:limit]:
+        for row, is_partial in rows[:limit]:
             result = bounded_content(json.loads(row["payload"]))
-            result["match_type"] = "exact_symbol" if row["exact_quality"] == 0 else "symbol_suffix" if row["exact_quality"] == 1 else "lexical"
+            result["match_type"] = "exact_symbol" if row["exact_quality"] == 0 else "symbol_suffix" if row["exact_quality"] == 1 else "partial" if is_partial else "lexical"
             result["bm25"] = row["score"]
             results.append(result)
         return {"query": query, "api_family": api_family, "document_type": document_type, "results": results, "has_more": len(rows) > limit, "limit": limit}
@@ -213,6 +232,156 @@ class Corpus:
             raise RetrievalError("Source changed since indexing; rebuild the index before reading this file")
         metadata = json.loads(row["payload"])
         return {**metadata, "heading_path": [path], "context": path, **line_window(data.decode("utf-8-sig"), start_line, end_line)}
+
+    def _api(self) -> dict:
+        if not hasattr(self, "_api_cache"):
+            with closing(self.connect()) as db:
+                rows = db.execute("SELECT name, display, owner, leaf, kind, origin FROM members").fetchall()
+                used = db.execute("SELECT kind, name FROM example_uses").fetchall()
+            api = {"names": {}, "owners": {}, "leaves": {}, "module_classes": {}, "used": {(row["kind"], row["name"]) for row in used}}
+            for row in rows:
+                api["names"].setdefault(row["name"], row["display"])
+                if row["owner"]:
+                    api["owners"].setdefault(row["owner"], set()).add(row["leaf"])
+                if row["kind"] != "class":
+                    api["leaves"].setdefault(row["leaf"], set()).add(row["owner"])
+                path = json.loads(row["origin"]).get("path")
+                if row["kind"] == "class" and path:
+                    api["module_classes"].setdefault(path.removesuffix(".lua"), set()).add(row["name"])
+            self._api_cache = api
+        return self._api_cache
+
+    def _member_details(self, names: list[str]) -> list[dict]:
+        if not names:
+            return []
+        with closing(self.connect()) as db:
+            rows = db.execute(f"SELECT name, display, kind, signature, summary, origin FROM members WHERE name IN ({','.join('?' * len(names))}) ORDER BY CASE kind WHEN 'documented' THEN 1 ELSE 0 END", names).fetchall()
+        grouped: dict[str, dict] = {}
+        for row in rows:
+            item = grouped.setdefault(row["name"], {"name": row["display"], "kind": row["kind"], "summary": "", "signatures": []})
+            item["summary"] = item["summary"] or row["summary"]
+            item["signatures"].append({"signature": row["signature"], "source": row["kind"], **json.loads(row["origin"])})
+        return [grouped[name] for name in names if name in grouped]
+
+    def list_members(self, namespace: str, limit: int = 100) -> dict[str, Any]:
+        """List the functions, fields and nested namespaces under a class or namespace.
+
+        Examples: core.graphics, game_object, izi, buff_manager, vec3. Each member has
+        its stub/doc signatures and a one-line summary. limit: 1..300 members.
+        """
+        if type(limit) is not int or not 1 <= limit <= MAX_MEMBERS:
+            raise RetrievalError("limit must be an integer between 1 and 300")
+        if not isinstance(namespace, str) or len(namespace) > 256 or not re.fullmatch(r"[A-Za-z_][A-Za-z_0-9]*(?:[.:][A-Za-z_][A-Za-z_0-9]*)*", namespace.strip()):
+            raise RetrievalError("namespace must be a Lua identifier, optionally qualified with dots or colons")
+        api = self._api()
+        owner = normalized_symbol(namespace)
+        leaves = sorted(api["owners"].get(owner, ()))
+        children = sorted({name[len(owner) + 1:].split(".", 1)[0] for name in api["owners"] if name.startswith(owner + ".")})
+        if not leaves and not children:
+            close = difflib.get_close_matches(owner, list(api["owners"]), n=8, cutoff=0.6)
+            raise RetrievalError("Unknown namespace; similar namespaces: " + (", ".join(close) or "none") + ". Use lookup_symbol for a single name.")
+        members = self._member_details([owner + "." + leaf for leaf in leaves[:limit]])
+        return {"namespace": namespace, "member_count": len(leaves), "members": members, "child_namespaces": [owner + "." + child for child in children], "has_more": len(leaves) > limit, "limit": limit}
+
+    def _resolve(self, parts: list[str], scanned) -> tuple[str, list[str] | None, dict]:
+        """Map a reference to API name candidates: (status, candidates, context)."""
+        api = self._api()
+        root = parts[0]
+        if root in scanned.requires:
+            path = scanned.requires[root]
+            if not is_sdk_module(path):
+                return "local_module", None, {"require": path}
+            owner = require_owner(path)
+            if owner in api["owners"]:
+                return "resolved", [owner, *parts[1:]], {"require": path}
+            classes = api["module_classes"].get("legacy/_api/" + path, set())
+            if classes:
+                # Modules such as common/enums return a table of top-level classes.
+                return "module", parts[1:], {"require": path, "classes": classes}
+            return "unresolved", None, {"require": path}
+        if root in scanned.aliases:
+            return self._resolve([*scanned.aliases[root], *parts[1:]], scanned)
+        if root in self.summary.get("globals", []) and root not in scanned.locals:
+            return "resolved", [part.casefold() for part in parts], {}
+        return "unresolved", None, {}
+
+    def check_lua_api(self, code: str) -> dict[str, Any]:
+        """Check Lua code for Sylvanas API names that do not exist; run before finalizing code.
+
+        Follows require() aliases, `local x = core.graphics` aliases and the core global.
+        Method calls on unknown receivers (`me:get_buffs()`) are checked by method name
+        against every class. Issues include close-match suggestions with signatures.
+        Static and best-effort: it cannot infer types returned from calls.
+        """
+        scanned = scan(code)
+        api = self._api()
+        issues, verified, unverifiable = [], {}, 0
+        seen_issues = set()
+        for reference in scanned.references:
+            if reference.parts[0] in {"_G", "self"} or (reference.parts[0] in scanned.locals and reference.parts[0] not in scanned.requires and reference.parts[0] not in scanned.aliases and reference.method_at is None):
+                unverifiable += 1
+                continue
+            status, candidate, context = self._resolve(reference.parts, scanned)
+            issue = None
+            if status == "local_module":
+                unverifiable += 1
+                continue
+            if status in {"resolved", "module"}:
+                lowered = [part.casefold() for part in candidate]
+                known = 0
+                for length in range(len(lowered), 0, -1):
+                    prefix = ".".join(lowered[:length])
+                    if prefix in api["names"] or prefix in api["owners"]:
+                        known = length
+                        break
+                if status == "module" and lowered[0] not in context["classes"]:
+                    known = 0  # only the module's own top-level classes count
+                if known == len(lowered) or (known and ".".join(lowered[:known]) not in api["owners"]):
+                    # A known function/field ends what can be checked statically.
+                    name = ".".join(lowered[:known])
+                    verified[name] = verified.get(name, 0) + 1
+                    continue
+                namespace = ".".join(lowered[:known])
+                missing = lowered[known] if known < len(lowered) else lowered[-1]
+                pool = sorted(api["owners"].get(namespace, ())) if known else sorted(context.get("classes", ()))
+                close = difflib.get_close_matches(missing, pool, n=5, cutoff=0.5)
+                suggestions = [(namespace + "." + item) if namespace else item for item in close]
+                where = f"`{namespace}`" if namespace else f"module {context.get('require')!r}"
+                if ("member", ".".join(lowered[:known + 1])) in api["used"]:
+                    issue = {"kind": "undocumented", "severity": "warning", "message": f"`{missing}` is not documented under {where}, but official examples use it", "suggestions": suggestions}
+                else:
+                    issue = {"kind": "unknown_member", "severity": "error", "message": f"`{missing}` is not a member of {where}", "suggestions": suggestions}
+            elif reference.method_at is not None:
+                method = reference.parts[reference.method_at].casefold()
+                if method in api["leaves"] or method in scanned.defined:
+                    unverifiable += 1
+                    continue
+                close = difflib.get_close_matches(method, list(api["leaves"]), n=5, cutoff=0.6)
+                suggestions = [sorted(owner + "." + item for owner in api["leaves"][item] if owner)[:1] or [item] for item in close]
+                if ("method", method) in api["used"]:
+                    issue = {"kind": "undocumented", "severity": "warning", "message": f"No documented class has a method `{method}`, but official examples call it", "suggestions": [item[0] for item in suggestions]}
+                else:
+                    issue = {"kind": "unknown_method", "severity": "error", "message": f"No Sylvanas class or documented API has a method `{method}`, and the code does not define it", "suggestions": [item[0] for item in suggestions]}
+            else:
+                unverifiable += 1
+                continue
+            key = (reference.expression, issue["message"])
+            if key in seen_issues:
+                continue
+            seen_issues.add(key)
+            if len(issues) < MAX_ISSUES:
+                issues.append({"line": reference.line, "expression": reference.expression, **issue, "suggestion_details": self._member_details(issue["suggestions"][:3])})
+        return {
+            "ok": not any(item["severity"] == "error" for item in issues),
+            "error_count": sum(item["severity"] == "error" for item in issues),
+            "warning_count": sum(item["severity"] == "warning" for item in issues),
+            "issues": issues,
+            "issue_count": len(seen_issues),
+            "verified": [{"name": api["names"].get(name, name), "uses": count} for name, count in sorted(verified.items())],
+            "unverifiable_reference_count": unverifiable,
+            "requires": scanned.requires,
+            "note": "Static check against indexed stubs and docs. It catches misspelled or invented names, not wrong argument types or values returned at runtime.",
+        }
 
     def corpus_status(self) -> dict[str, Any]:
         """Return snapshot provenance, counts, filter values and response limits.

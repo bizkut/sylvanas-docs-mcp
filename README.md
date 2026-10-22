@@ -1,7 +1,8 @@
 # Sylvanas developer documentation MCP
 
-Local, read-only retrieval over the downloaded Sylvanas developer documentation,
-example pages, and the Lua source checkout. SQLite FTS5 supplies lexical/BM25
+Local, read-only retrieval over the downloaded Sylvanas documentation (`/dev`,
+`/examples`, `/getting-started`, `/guides`, `/modules`, `/plugins`) and the Lua
+source checkout. SQLite FTS5 supplies lexical/BM25
 search; an exact-symbol table puts API definitions ahead of incidental mentions.
 There are no embeddings, API keys, hosted databases, or game/runtime integration.
 
@@ -116,6 +117,8 @@ not those client hints.
 | `get_section` | `url`, `heading?`, `start_line=1`, `end_line?` | Return a page or heading subtree in original Markdown order, including nested sections. No network fetch. |
 | `search_examples` | `query`, `api_family?`, `limit=5` | Search example pages, Lua example files, and documentation chunks containing code. Excludes Lua stubs. |
 | `read_api_source` | `path`, `start_line=1`, `end_line?` | Read only an indexed Lua source file under the configured checkout, checking its current hash. |
+| `list_members` | `namespace`, `limit=100` | List every function, field and child namespace under a class or namespace (`core.graphics`, `game_object`, `izi`), each with stub/doc signatures and a one-line summary. Unknown namespaces return close matches. |
+| `check_lua_api` | `code` | Statically check Lua code (up to 100000 characters) for API names that do not exist. Follows `require("common/...")` and `local g = core.graphics` aliases and the `core` global; ignores strings, comments, plugin-local modules and names the code defines. Method calls on unknown receivers are checked by method name. Errors carry close-match suggestions with signatures; names that are undocumented but used by official examples are warnings. |
 | `corpus_status` | none | Snapshot counts, build time, input hashes, source revision, known asset-failure count, filter values and limits. |
 
 - `api_family` is `izi`, `legacy`, or `general`; it is derived from the corpus URL
@@ -126,10 +129,18 @@ not those client hints.
   code cannot be mistaken for stubs. Pages under `/examples` and `/dev/examples`
   are type `example`, including overview chunks without code. Code-bearing API
   docs stay type `docs` even when returned by `search_examples`.
-- Search terms are literal words/identifiers combined with **AND**, not raw SQL
-  or FTS expressions. Punctuation splits lexical terms; exact lookup preserves
-  identifier structure. Try fewer words when a conceptual query misses. Lexical
-  search has no semantic/embedding fallback.
+- Search uses Porter stemming, so `debuffs`, `interrupting` and `logs` match
+  `debuff`, `interrupt` and `log`.
+- `check_lua_api` is a static, best-effort check. It catches misspelled or invented
+  names, not wrong argument types, and it cannot follow types returned by calls
+  (`me:get_buffs()` is checked as "some class has get_buffs"). Over the 33 bundled
+  example plugins it reports no errors.
+- Search terms are literal words/identifiers, not raw SQL or FTS expressions.
+  Question filler ("how", "do", "I", "a", "the", ...) is dropped and the rest are
+  combined with **AND**; when that yields fewer than `limit` results, records
+  matching any of the words fill the remainder with `match_type: "partial"`.
+  Punctuation splits lexical terms; exact lookup preserves identifier structure.
+  Lexical search has no semantic/embedding fallback.
 - Definitions are extracted from identifier/signature headings (including
   parameters and `->` return annotations) and Lua `function`, `---@class`, and
   `---@field` declarations. Prose headings mentioning an API are not definitions.

@@ -13,7 +13,7 @@ from .retrieval import Corpus
 
 WORKSPACE = Path(__file__).resolve().parent.parent
 DEFAULT_DATABASE = WORKSPACE / ".sylvanas" / "index.sqlite3"
-TOOL_NAMES = ("lookup_symbol", "search_docs", "get_section", "search_examples", "read_api_source", "corpus_status")
+TOOL_NAMES = ("lookup_symbol", "search_docs", "get_section", "search_examples", "read_api_source", "list_members", "check_lua_api", "corpus_status")
 
 
 def main() -> int:

@@ -16,7 +16,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 from bs4 import BeautifulSoup
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 MAX_FILE_BYTES = 8 * 1024 * 1024
 IDENTIFIER = r"[A-Za-z_][A-Za-z_0-9]*(?:[.:][A-Za-z_][A-Za-z_0-9]*)*"
 SYMBOL_RE = re.compile(IDENTIFIER)
@@ -149,6 +149,75 @@ def lua_declarations(lines: list[str]) -> list[tuple[int, str]]:
     return found
 
 
+def lua_member(lines: list[str], index: int, name: str) -> dict:
+    """Describe one stub declaration: its signature, nearby annotations and summary text."""
+    line = lines[index].strip()
+    if line.startswith("---@class"):
+        kind, signature = "class", line.removeprefix("---@class").strip()
+    elif line.startswith("---@field"):
+        signature = re.sub(r"^---@field\s+(?:(?:public|private|protected)\s+)?", "", line)
+        kind = "function" if re.search(r"\sfun\s*\(", " " + signature.split(None, 1)[-1]) else "field"
+    else:
+        kind, signature = "function", line
+    annotations, summary = [], []
+    cursor = index - 1
+    # Descriptions sit directly above a declaration; a sibling @field/@class ends the block.
+    while cursor >= 0 and lines[cursor].lstrip().startswith("---"):
+        text = lines[cursor].strip().removeprefix("---").strip()
+        if text.startswith(("@field", "@class")):
+            break
+        if text.startswith(("@param", "@return")):
+            annotations.insert(0, "---" + text)
+        elif text and not text.startswith("@"):
+            summary.insert(0, text)
+        cursor -= 1
+    if annotations and kind == "function":
+        signature = "\n".join(annotations + [signature])
+    return {"kind": kind, "signature": signature, "summary": " ".join(summary)[:300]}
+
+
+DOC_LABELS = {"syntax", "returns", "return", "parameters", "parameter", "arguments", "description", "example",
+              "examples", "example usage", "usage", "notes", "note", "signature"}
+
+
+def doc_member(symbol: str, heading: str, content: str) -> tuple[str, str]:
+    """Signature and summary for a documented symbol: the first code line naming it, and its
+    Description paragraph (else the first prose line that is not a section label)."""
+    signature, summary, fallback = heading, "", ""
+    fence = False
+    after_description = False
+    open_signature = False
+    leaf = symbol.replace(":", ".").rsplit(".", 1)[-1]
+    for line in content.splitlines():
+        stripped = line.strip()
+        if stripped.startswith(("```", "~~~")):
+            fence = not fence
+            continue
+        if fence:
+            if open_signature:
+                # Multi-line parameter lists continue until the parentheses balance.
+                signature += (" " if signature.endswith(",") else "") + stripped
+                open_signature = signature.count("(") > signature.count(")") and len(signature) < 400
+            elif signature == heading and leaf in stripped and "(" in stripped and not stripped.startswith(("local ", "--")):
+                signature = stripped
+                open_signature = signature.count("(") > signature.count(")")
+            continue
+        label = stripped.strip("*:").strip().casefold()
+        if not stripped or stripped.startswith(("#", "|", ">", "-", "---")) or label in DOC_LABELS:
+            after_description = after_description or label == "description"
+            continue
+        if after_description and not summary:
+            summary = stripped
+        fallback = fallback or stripped
+    return signature, (summary or fallback)[:300]
+
+
+def add_member(db: sqlite3.Connection, display: str, kind: str, signature: str, summary: str, origin: dict) -> None:
+    name = normalized_symbol(display)
+    owner, _, leaf = name.rpartition(".")
+    db.execute("INSERT OR IGNORE INTO members VALUES(?,?,?,?,?,?,?,?)", (name, display.replace(":", "."), owner, leaf, kind, signature, summary, json.dumps(origin, ensure_ascii=False)))
+
+
 def family_for_page(url: str) -> str:
     path = urlsplit(url).path.lower()
     if "/izi" in path or "/examples/izi/" in path:
@@ -171,7 +240,13 @@ CREATE TABLE symbols (name TEXT NOT NULL, record_id INTEGER NOT NULL, quality IN
                       PRIMARY KEY(name, record_id));
 CREATE INDEX symbol_lookup ON symbols(name, quality);
 CREATE INDEX record_filters ON records(family, kind, example);
-CREATE VIRTUAL TABLE search USING fts5(title, context, content, tokenize='unicode61');
+CREATE TABLE members (name TEXT NOT NULL, display TEXT NOT NULL, owner TEXT NOT NULL, leaf TEXT NOT NULL,
+                      kind TEXT NOT NULL, signature TEXT NOT NULL, summary TEXT NOT NULL, origin TEXT NOT NULL,
+                      PRIMARY KEY(name, origin));
+CREATE INDEX member_owner ON members(owner);
+CREATE INDEX member_leaf ON members(leaf);
+CREATE TABLE example_uses (kind TEXT NOT NULL, name TEXT NOT NULL, PRIMARY KEY(kind, name));
+CREATE VIRTUAL TABLE search USING fts5(title, context, content, tokenize='porter unicode61');
 """
 
 
@@ -224,6 +299,7 @@ def build_index(corpus: Path, source_root: Path, destination: Path, revision: st
         db = sqlite3.connect(temporary)
         db.executescript(SCHEMA)
         pages = {}
+        example_code = []
         for page in load_jsonl(corpus / "pages.jsonl"):
             url = canonical_url(page["source_url"])
             markdown = safe_read(corpus, page["markdown_path"])
@@ -236,6 +312,7 @@ def build_index(corpus: Path, source_root: Path, destination: Path, revision: st
             pages[url] = metadata
             db.execute("INSERT INTO pages VALUES(?,?,?)", (url, json.dumps(metadata), content))
             page_sections = sections(content)
+            example_code.append("\n".join(re.findall(r"(?ms)^\s*```lua[^\n]*\n(.*?)^\s*```", content)))
             if page.get("raw_path"):
                 raw = safe_read(corpus, page["raw_path"])
                 if digest(raw) != page["source_sha256"]:
@@ -263,9 +340,13 @@ def build_index(corpus: Path, source_root: Path, destination: Path, revision: st
                 raise RetrievalError(f"Invalid chunk reference or content hash: {chunk['id']}")
             metadata = pages[url]
             payload = {**metadata, "id": chunk["id"], "heading_path": chunk["heading_path"], "context": chunk["context"], "content": chunk["content"], "content_sha256": chunk["content_sha256"], "part": chunk["part"], "is_example": metadata["document_type"] == "example" or bool(re.search(r"(?m)^\s*(?:>\s*)?`{3,}(?:lua|luau)?\s*$", chunk["content"]))}
-            add_record(db, payload, heading_symbols(chunk["heading_path"][-1:]))
+            symbols = heading_symbols(chunk["heading_path"][-1:])
+            add_record(db, payload, symbols)
+            for symbol in symbols:
+                add_member(db, symbol, "documented", *doc_member(symbol, chunk["heading_path"][-1].strip().strip("`"), chunk["content"]), {"url": url, "context": chunk["context"]})
             chunk_count += 1
         source_count = 0
+        globals_found = set()
         for path in sorted(source_root.rglob("*.lua")):
             relative = path.relative_to(source_root).as_posix()
             data = safe_read(source_root, relative)
@@ -275,6 +356,12 @@ def build_index(corpus: Path, source_root: Path, destination: Path, revision: st
             metadata = {"path": relative, "source_url": f"{repository_url.rstrip('/')}/blob/{revision}/{relative}", "url": f"{repository_url.rstrip('/')}/blob/{revision}/{relative}", "source_sha256": digest(data), "repository_revision": revision, "document_type": kind, "source_kind": "lua_source", "api_family": family, "title": relative, "total_lines": len(lines)}
             db.execute("INSERT INTO sources VALUES(?,?,?)", (relative, digest(data), json.dumps(metadata)))
             declarations = lua_declarations(lines)
+            if kind == "example":
+                example_code.append(data.decode("utf-8-sig"))
+            if kind == "stub":
+                globals_found.update(re.findall(r"(?m)^\s*_G\.([A-Za-z_][A-Za-z_0-9]*)\s*=", data.decode("utf-8-sig")))
+                for index, name in declarations:
+                    add_member(db, name, **lua_member(lines, index, name), origin={"path": relative, "line": index + 1, "url": f"{metadata['url']}#L{index + 1}"})
             # Fixed source windows bound whole examples; declaration windows preserve
             # annotations and signatures independently of those chunk boundaries.
             windows = [(start, min(start + 100, len(lines)), set()) for start in range(0, len(lines), 100)]
@@ -289,9 +376,15 @@ def build_index(corpus: Path, source_root: Path, destination: Path, revision: st
                 payload = {**metadata, "id": f"source:{relative}:{ordinal}", "heading_path": [relative, *sorted(symbols)], "context": context, "content": content, "content_sha256": digest(content.encode()), "start_line": start + 1, "end_line": end, "is_example": kind == "example"}
                 add_record(db, payload, symbols)
             source_count += 1
+        from .checker import used_names  # the checker imports this module
+
+        uses = set()
+        for code in example_code:
+            uses |= used_names(code, globals_found)
+        db.executemany("INSERT OR IGNORE INTO example_uses VALUES(?,?)", sorted(uses))
         if not pages or not chunk_count or not source_count:
             raise RetrievalError("Corpus pages, chunks and Lua sources must all be nonempty")
-        summary = {"schema_version": SCHEMA_VERSION, "built_at": dt.datetime.now(dt.timezone.utc).isoformat(), "page_count": len(pages), "chunk_count": chunk_count, "source_file_count": source_count, "record_count": db.execute("SELECT count(*) FROM records").fetchone()[0], "source_root": str(source_root), "corpus_root": str(corpus), "repository_url": repository_url, "repository_revision": revision, "manifest_sha256": digest(manifest_bytes), "pages_jsonl_sha256": digest((corpus / "pages.jsonl").read_bytes()), "chunks_jsonl_sha256": digest((corpus / "chunks.jsonl").read_bytes()), "asset_failure_count": manifest.get("asset_failure_count", 0), "scope": manifest.get("scope", []), "embeddings": False}
+        summary = {"schema_version": SCHEMA_VERSION, "built_at": dt.datetime.now(dt.timezone.utc).isoformat(), "page_count": len(pages), "chunk_count": chunk_count, "source_file_count": source_count, "record_count": db.execute("SELECT count(*) FROM records").fetchone()[0], "source_root": str(source_root), "corpus_root": str(corpus), "repository_url": repository_url, "repository_revision": revision, "manifest_sha256": digest(manifest_bytes), "pages_jsonl_sha256": digest((corpus / "pages.jsonl").read_bytes()), "chunks_jsonl_sha256": digest((corpus / "chunks.jsonl").read_bytes()), "asset_failure_count": manifest.get("asset_failure_count", 0), "scope": manifest.get("scope", []), "embeddings": False, "member_count": db.execute("SELECT count(DISTINCT name) FROM members").fetchone()[0], "globals": sorted(globals_found)}
         db.execute("INSERT INTO metadata VALUES('summary',?)", (json.dumps(summary),))
         db.commit()
         db.close()
