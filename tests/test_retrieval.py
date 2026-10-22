@@ -5,6 +5,7 @@ from pathlib import Path
 import sqlite3
 import tempfile
 import unittest
+import unittest.mock
 
 from sylvanas_docs.index import RetrievalError, build_index, digest
 from sylvanas_docs.retrieval import Corpus
@@ -272,6 +273,12 @@ end
         directory.symlink_to(directory.with_name("saved"), target_is_directory=True)
         with self.assertRaisesRegex(RetrievalError, "symlink"):
             self.service.read_api_source("legacy/_api/core.lua")
+
+    def test_portable_reads_reject_the_same_paths(self):
+        # The fallback used where descriptor-relative opens are unavailable (Windows).
+        with unittest.mock.patch("sylvanas_docs.index.DESCRIPTOR_READS", False):
+            self.assertTrue(self.service.read_api_source("legacy/_api/core.lua")["content"])
+            self.test_traversal_absolute_unindexed_and_symlink_paths_rejected()
 
     def test_invalid_limits_filters_and_fts_syntax(self):
         for kwargs in ({"limit": 0}, {"limit": 21}, {"limit": True}, {"api_family": "unknown"}, {"document_type": "runtime"}):

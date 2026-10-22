@@ -1,9 +1,7 @@
-#!/usr/bin/env python3
 """Mirror Project Sylvanas developer docs into an LLM-friendly local corpus."""
 
 from __future__ import annotations
 
-import argparse
 import concurrent.futures
 import datetime as dt
 import hashlib
@@ -11,7 +9,6 @@ import json
 import os
 import re
 import shutil
-import sys
 import time
 import urllib.error
 import urllib.parse
@@ -558,15 +555,12 @@ def replace_output(build: Path, output: Path) -> None:
         shutil.rmtree(backup)
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--output", type=Path, default=Path("corpus"), help="generated corpus directory")
-    parser.add_argument("--workers", type=int, default=8, help="parallel HTTP requests")
-    args = parser.parse_args()
-    if args.workers < 1 or args.workers > 32:
-        parser.error("--workers must be between 1 and 32")
-
-    output = args.output.resolve()
+def fetch_corpus(output: Path, workers: int = 8, assets: bool = True) -> dict[str, object]:
+    """Download the docs into output, replacing it atomically. Images and other linked
+    assets are optional: retrieval never reads them, and skipped links stay remote."""
+    if workers < 1 or workers > 32:
+        raise ValueError("workers must be between 1 and 32")
+    output = output.resolve()
     build = prepare_build_dir(output)
     fetched_at = utc_now()
     urls, sitemap_response = load_scoped_urls()
@@ -575,7 +569,7 @@ def main() -> int:
 
     page_responses: dict[str, Response] = {}
     failures: list[dict[str, str]] = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
         futures = {executor.submit(fetch, url, PAGE_LIMIT_BYTES): url for url in urls}
         for future in concurrent.futures.as_completed(futures):
             url = futures[future]
@@ -620,8 +614,8 @@ def main() -> int:
     asset_records: list[dict[str, object]] = []
     asset_paths: dict[str, str] = {}
     asset_failures: list[dict[str, str]] = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as executor:
-        futures = {executor.submit(fetch, url, ASSET_LIMIT_BYTES): url for url in sorted(asset_urls)}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {executor.submit(fetch, url, ASSET_LIMIT_BYTES): url for url in sorted(asset_urls if assets else ())}
         for future in concurrent.futures.as_completed(futures):
             url = futures[future]
             try:
@@ -726,29 +720,12 @@ def main() -> int:
     }
     json_dump(build / "manifest.json", manifest)
     replace_output(build, output)
-
-    print(
-        json.dumps(
-            {
-                "output": str(output),
-                "pages": len(page_records),
-                "chunks": len(chunks),
-                "links": len(link_rows),
-                "assets": len(asset_records),
-                "assets_downloaded": len(asset_paths),
-                "asset_failures": len(asset_failures),
-            },
-            sort_keys=True,
-        )
-    )
-    return 0
-
-
-if __name__ == "__main__":
-    try:
-        raise SystemExit(main())
-    except KeyboardInterrupt:
-        raise SystemExit(130) from None
-    except Exception as error:
-        print(f"error: {error}", file=sys.stderr)
-        raise SystemExit(1) from error
+    return {
+        "output": str(output),
+        "pages": len(page_records),
+        "chunks": len(chunks),
+        "links": len(link_rows),
+        "assets": len(asset_records),
+        "assets_downloaded": len(asset_paths),
+        "asset_failures": len(asset_failures),
+    }

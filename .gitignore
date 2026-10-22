@@ -2,3 +2,10 @@
 .sylvanas/
 __pycache__/
 *.py[cod]
+dist/
+build/
+*.egg-info/
+
+# Downloaded third-party content: built locally by `sylvanas-docs setup`, never committed.
+corpus/
+sources/

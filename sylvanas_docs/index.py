@@ -50,6 +50,8 @@ def safe_read(root: Path, relative: str) -> bytes:
         raise RetrievalError("Path must be relative to the source root, without traversal or backslashes")
     if not parts:
         raise RetrievalError("A file path is required")
+    if not DESCRIPTOR_READS:
+        return portable_read(root, parts)
     descriptor = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
     try:
         for part in parts[:-1]:
@@ -69,6 +71,35 @@ def safe_read(root: Path, relative: str) -> bytes:
         raise RetrievalError("File unavailable or symlink traversal rejected") from error
     finally:
         os.close(descriptor)
+
+
+# Windows lacks O_NOFOLLOW/O_DIRECTORY and dir_fd opens; it uses portable_read instead.
+DESCRIPTOR_READS = hasattr(os, "O_NOFOLLOW") and hasattr(os, "O_DIRECTORY") and os.open in os.supports_dir_fd
+
+
+def portable_read(root: Path, parts: tuple[str, ...]) -> bytes:
+    """Path-based fallback: reject symlinks at every child component and confirm the
+    resolved file stays under root. Unlike descriptor reads it cannot rule out a
+    component being swapped between the check and the open."""
+    path = Path(root)
+    for part in parts:
+        path = path / part
+        if path.is_symlink():
+            raise RetrievalError("File unavailable or symlink traversal rejected")
+    try:
+        resolved = path.resolve(strict=True)
+        if not resolved.is_relative_to(Path(root).resolve(strict=True)):
+            raise RetrievalError("File unavailable or symlink traversal rejected")
+        info = resolved.stat()
+        if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_FILE_BYTES:
+            raise RetrievalError("Source must be a regular file no larger than 8 MiB")
+        with resolved.open("rb") as stream:
+            data = stream.read(MAX_FILE_BYTES + 1)
+    except OSError as error:
+        raise RetrievalError("File unavailable or symlink traversal rejected") from error
+    if len(data) > MAX_FILE_BYTES:
+        raise RetrievalError("Source exceeds the 8 MiB read bound")
+    return data
 
 
 def markdown_body(text: str) -> str:

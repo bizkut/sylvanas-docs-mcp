@@ -1,0 +1,32 @@
+[build-system]
+requires = ["hatchling>=1.21"]
+build-backend = "hatchling.build"
+
+[project]
+name = "sylvanas-docs-mcp"
+version = "1.1.0"
+description = "Local, read-only MCP server for searching the Project Sylvanas Lua docs and SDK, and checking Lua code for invented API calls"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.10"
+authors = [{ name = "bizkut" }]
+keywords = ["mcp", "model-context-protocol", "lua", "documentation", "rag", "claude"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Operating System :: OS Independent",
+  "Topic :: Software Development :: Documentation",
+]
+dependencies = ["beautifulsoup4>=4.14,<5", "mcp>=2.3,<3"]
+
+[project.urls]
+Repository = "https://github.com/bizkut/sylvanas-docs-mcp"
+
+[project.scripts]
+sylvanas-docs = "sylvanas_docs.__main__:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["sylvanas_docs"]
+
+[tool.hatch.build.targets.sdist]
+include = ["sylvanas_docs", "tests", "README.md", "LICENSE"]
