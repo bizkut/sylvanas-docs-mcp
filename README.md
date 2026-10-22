@@ -6,7 +6,7 @@ source checkout. SQLite FTS5 supplies lexical/BM25
 search; an exact-symbol table puts API definitions ahead of incidental mentions.
 There are no embeddings, API keys, hosted databases, or game/runtime integration.
 
-The downloaded corpus contains 98 documentation pages. The source checkout used
+The downloaded corpus contains 117 documentation pages. The source checkout used
 when adding this server is `60ef94704d0d787133918beb90af023656d4f724` of
 [`bluesilvi/project-sylvanas`](https://github.com/bluesilvi/project-sylvanas).
 These describe a snapshot, not a promise that documentation and stubs agree or
@@ -69,6 +69,9 @@ JSON to stdout; failures go to stderr with a nonzero exit status.
   --args '{"url":"https://docs.project-sylvanas.net/dev/api/core","heading":"core.register_on_update_callback"}'
 .venv/bin/python -m sylvanas_docs query read_api_source \
   --args '{"path":"legacy/_api/core.lua","start_line":1,"end_line":40}'
+.venv/bin/python -m sylvanas_docs query list_members --args '{"namespace":"core.graphics"}'
+.venv/bin/python -m sylvanas_docs query check_lua_api \
+  --args '{"code":"core.graphics.draw_circle(p, 5)\ncore.log(\"x\")"}'
 ```
 
 `query` and `serve` accept `--database PATH` and an optional `--source-root PATH`
@@ -199,7 +202,7 @@ Run behavioral tests (temporary fixtures; no network or source changes):
 ```
 
 Build the real index and run the CLI examples above. Then exercise actual stdio
-initialization, tool listing, all six tools, read-only hints and a rejected
+initialization, tool listing, all eight tools, read-only hints and a rejected
 traversal through the official client (from this workspace):
 
 ```sh
@@ -221,7 +224,8 @@ async def main():
         print("Protocol:", client.protocol_version)
         tools = (await client.list_tools()).tools
         expected = {"lookup_symbol", "search_docs", "get_section",
-                    "search_examples", "read_api_source", "corpus_status"}
+                    "search_examples", "read_api_source", "list_members",
+                    "check_lua_api", "corpus_status"}
         assert {tool.name for tool in tools} == expected
         assert all(tool.annotations.read_only_hint for tool in tools)
         calls = [
@@ -232,6 +236,8 @@ async def main():
                              "heading": "core.register_on_update_callback"}),
             ("search_examples", {"query": "core.log", "api_family": "legacy", "limit": 3}),
             ("read_api_source", {"path": "legacy/_api/core.lua", "start_line": 1, "end_line": 20}),
+            ("list_members", {"namespace": "core.graphics", "limit": 5}),
+            ("check_lua_api", {"code": "core.graphics.draw_circle(p, 5)\ncore.log('x')"}),
         ]
         for name, arguments in calls:
             result = await client.call_tool(name, arguments)
@@ -239,10 +245,14 @@ async def main():
             data = result.structured_content
             assert data is not None, name
             if name == "corpus_status":
-                assert data["page_count"] == 98
+                assert data["page_count"] == 117
                 assert data["read_only"] and not data["embeddings"]
             elif name == "lookup_symbol":
                 assert data["definitions"]
+            elif name == "list_members":
+                assert data["members"]
+            elif name == "check_lua_api":
+                assert [issue["expression"] for issue in data["issues"]] == ["core.graphics.draw_circle"]
             elif name in {"search_docs", "search_examples"}:
                 assert data["results"]
             else:
