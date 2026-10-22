@@ -1,0 +1,4 @@
+.venv/
+.sylvanas/
+__pycache__/
+*.py[cod]

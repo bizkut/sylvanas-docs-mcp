@@ -1,0 +1,3 @@
+[submodule "sources/project-sylvanas-api"]
+	path = sources/project-sylvanas-api
+	url = https://github.com/bluesilvi/project-sylvanas.git
