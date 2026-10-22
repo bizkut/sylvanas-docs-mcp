@@ -133,12 +133,12 @@ def route_stem(url: str) -> Path:
 
 def json_dump(path: Path, value: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    path.write_text(json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8", newline="\n")
 
 
 def jsonl_dump(path: Path, rows: Iterable[dict[str, object]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as output:
+    with path.open("w", encoding="utf-8", newline="\n") as output:
         for row in rows:
             output.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
 
@@ -671,7 +671,7 @@ def fetch_corpus(output: Path, workers: int = 8, assets: bool = True) -> dict[st
             "source_sha256": sha256(response.body),
         }
         document = markdown_document(metadata, body)
-        page_path.write_text(document, encoding="utf-8")
+        page_path.write_text(document, encoding="utf-8", newline="\n")
         document_bytes = document.encode("utf-8")
         page_chunks = chunk_markdown(url, str(page["title"]), body)
         chunks.extend(page_chunks)

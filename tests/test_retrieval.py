@@ -25,17 +25,17 @@ class RetrievalTests(unittest.TestCase):
         self.sources.mkdir()
         self.source = self.sources / "legacy/_api/core.lua"
         self.source.parent.mkdir(parents=True)
-        self.source.write_text("---@class core\n--- Log a message.\nfunction core.log(message) end\n---@field public count number\n", encoding="utf-8")
+        self.source.write_text("---@class core\n--- Log a message.\nfunction core.log(message) end\n---@field public count number\n", encoding="utf-8", newline="\n")
         example = self.sources / "izi/demo/main.lua"
         example.parent.mkdir(parents=True)
-        example.write_text("local spell = izi.spell(123)\ncore.log('example')\n", encoding="utf-8")
+        example.write_text("local spell = izi.spell(123)\ncore.log('example')\n", encoding="utf-8", newline="\n")
         self.pages, self.chunks = [], []
         self.add_page("/dev/api/core", "Core", "# Core\n\n## `core.log`\n\nA logging definition.\n\n```lua\ncore.log('hello')\n```\n\n### Notes\n\nChild explanation.\n\n## Other\n\nNot in the log section.\n", [(["Core", "core.log"], "## `core.log`\n\nA logging definition.\n```lua\ncore.log('hello')\n```\n")])
         self.add_page("/dev/api/guide", "Guide", "# Guide\n\n## Tips\n\ncore.log core.log core.log mentions, not definitions.\n", [(["Guide", "Tips"], "core.log core.log core.log mentions, not definitions.")])
         self.add_page("/dev/libraries/izi/izi-spells", "IZI", "# IZI\n\n## `izi.spell`\n\nCreate a spell.\n", [(["IZI", "izi.spell"], "## `izi.spell`\n\nCreate a spell.\n")])
         self.add_page("/examples/izi/demo", "Demo", "# Demo\n\n## Sample\n\n```lua\ncore.log(izi.spell(123))\n```\n", [(["Demo", "Sample"], "```lua\ncore.log(izi.spell(123))\n```\n")])
         self.add_page("/dev/sections", "Sections", "# Sections\n\n## First\n\n### Shared\n\nfirst content\n\n```lua\n## Not a heading\n```\n\n## Second\n\n### Shared\n\nsecond content\n", [(["Sections", "First"], "first content")])
-        (self.corpus / "manifest.json").write_text(json.dumps({"scope": ["/dev/**", "/examples/**"], "asset_failure_count": 7}))
+        (self.corpus / "manifest.json").write_text(json.dumps({"scope": ["/dev/**", "/examples/**"], "asset_failure_count": 7}), newline="\n")
         self.database = self.root / "index.sqlite3"
         self.rebuild()
 
@@ -43,14 +43,14 @@ class RetrievalTests(unittest.TestCase):
         path = "pages/" + route.strip("/") + ".md"
         output = self.corpus / path
         output.parent.mkdir(parents=True, exist_ok=True)
-        output.write_text(content, encoding="utf-8")
+        output.write_text(content, encoding="utf-8", newline="\n")
         self.pages.append({"source_url": BASE + route, "canonical_url": BASE + route, "markdown_path": path, "markdown_sha256": digest(content.encode()), "source_sha256": digest(("html:" + content).encode()), "title": title, "fetched_at": "2026-10-22T00:00:00Z"})
         for headings, text in chunks:
             self.chunks.append({"id": str(len(self.chunks)), "url": BASE + route, "page_title": title, "heading_path": headings, "context": " > ".join(headings), "content": text, "content_sha256": digest(text.encode()), "part": 0})
 
     def write_records(self):
         for filename, records in (("pages.jsonl", self.pages), ("chunks.jsonl", self.chunks)):
-            (self.corpus / filename).write_text("".join(json.dumps(row) + "\n" for row in records), encoding="utf-8")
+            (self.corpus / filename).write_text("".join(json.dumps(row) + "\n" for row in records), encoding="utf-8", newline="\n")
 
     def rebuild(self):
         self.write_records()
@@ -77,11 +77,11 @@ class RetrievalTests(unittest.TestCase):
         self.assertIn("Core > core.log", [item["context"] for item in partial])
 
     def add_api_fixtures(self):
-        (self.sources / "legacy/_api/globals.lua").write_text("_G.core = {}\n", encoding="utf-8")
+        (self.sources / "legacy/_api/globals.lua").write_text("_G.core = {}\n", encoding="utf-8", newline="\n")
         module = self.sources / "legacy/_api/common/modules/demo_mod.lua"
         module.parent.mkdir(parents=True)
-        module.write_text("---@class demo_mod\n---Runs the demo.\n---@field public run fun(self: demo_mod): boolean\n", encoding="utf-8")
-        (self.sources / "izi/demo/extra.lua").write_text("core.secret_helper()\nlocal x = get()\nx:hidden_method()\n", encoding="utf-8")
+        module.write_text("---@class demo_mod\n---Runs the demo.\n---@field public run fun(self: demo_mod): boolean\n", encoding="utf-8", newline="\n")
+        (self.sources / "izi/demo/extra.lua").write_text("core.secret_helper()\nlocal x = get()\nx:hidden_method()\n", encoding="utf-8", newline="\n")
         self.rebuild()
 
     def test_check_lua_api_flags_invented_names_with_suggestions(self):
@@ -252,7 +252,7 @@ end
         self.assertEqual(result["content"], "--- Log a message.\nfunction core.log(message) end\n")
         self.assertEqual(result["next_line"], 4)
         self.assertEqual(result["returned_content_sha256"], digest(result["content"].encode()))
-        self.source.write_text("changed", encoding="utf-8")
+        self.source.write_text("changed", encoding="utf-8", newline="\n")
         with self.assertRaisesRegex(RetrievalError, "changed since indexing"):
             self.service.read_api_source("legacy/_api/core.lua")
 
