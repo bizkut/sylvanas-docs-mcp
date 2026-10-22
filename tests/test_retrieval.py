@@ -1,5 +1,6 @@
 """Behavioral contracts for lexical retrieval, attribution and filesystem bounds."""
 
+from contextlib import closing
 import json
 from pathlib import Path
 import sqlite3
@@ -296,7 +297,9 @@ end
             self.service.read_api_source("legacy/_api/core.lua", 1, 401)
 
     def test_snapshot_is_read_only_and_failed_build_is_atomic(self):
-        with self.service.connect() as db:
+        # sqlite3's own context manager does not close the connection, and Windows
+        # cannot delete the temporary directory while the file is open.
+        with closing(self.service.connect()) as db:
             with self.assertRaises(sqlite3.OperationalError):
                 db.execute("DELETE FROM pages")
         original = self.database.read_bytes()
